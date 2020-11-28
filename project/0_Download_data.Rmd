@@ -1,0 +1,20 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Download the data needed for this project
+```{r}
+setwd("/home/jovyan/project/")
+
+url = 'https://cloud.epinux.com/s/2BSKGFaRoC2bXoi/download'
+destfile = 'Data.zip'
+
+download.file(url, destfile, 'auto', quiet = FALSE, mode = "w",
+              cacheOK = TRUE,
+              extra = getOption("download.file.extra"),
+              headers = NULL)
+unzip('Data.zip', exdir = '.')
+
+```
+
