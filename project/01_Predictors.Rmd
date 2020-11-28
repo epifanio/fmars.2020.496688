@@ -1,0 +1,227 @@
+---
+title: "Part 1: Processing of environmental data layers"
+author: Genoveva Gonzalez-Mirelis
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+## Introduction
+
+This part describes how to process the environmental layers to produce a predictor brick. The input files are the following: bathymetry, oceanographic variables, satellite image data, and landscape type. Note: Blending of oceanographic  layers (from NK800 and B800) is not included here, but feel free to contact me if you need to know the details of how that was done.
+
+Another required input to run this Notebook is a shapefile of the area we are interested in modelling, which we call "mask".
+
+All the required data is in the Data folder which you need to download and unzip directly in your working directory.
+
+The output from this Notebook is an R stack of all layers, which is required as input for the spatial distribution model. This will be written to a new folder which will be created in this Notebook ("_PredictorStack") as an .RData file.
+
+A bunch of intermediate files with extensions .RData, .tif, and .img will also be written in the PredictorData folder (at the root directory) which weren't there before.
+
+## Setup and inputs
+
+Specify data paths, load libraries.
+```{r, message=FALSE, warning = FALSE}
+
+setwd("/home/jovyan/project/")
+
+#Libraries
+library(RCurl)
+library(rgdal)
+library(raster)
+library(rgrass7)
+library(spatialEco) #vrm
+library(cluster) #terrain classification
+library(randomForest) #terrain classification
+
+
+#download and unzip the Data folder
+
+PredictorData = "Data/PredictorData"
+
+```
+
+Load and plot the modelling area.
+```{r}
+
+mask <- readOGR(file.path("Data", "BaseLayers","mask.shp"), verbose = FALSE)
+plot(mask)
+
+```
+
+## Data processing
+
+### Bathymetry and basic derivatives
+
+Bathymetric data was downloaded from EMODnet Bathymetry (EMODnet Bathymetry Consortium (2018): EMODnet Digital Bathymetry (DTM). http://doi.org/10.12770/18ff0d48-b203-4a65-94a9-5fd8b0ec35f6). The tiles used were B5, B6, B7, B8, C5, C6, C7. These were mosaicked into one single layer elsewhere, and are provided as a single geotiff file in the data folder.
+
+All variables that are computed at multiple scales are presented in Table 1.
+
+In this block we derive basic terrain variables, including: topographic position index (at two scales), ruggosity, roughness, and slope.
+```{r, message=FALSE, warning = FALSE}
+
+bas_derivatives <- file.path(PredictorData, "t1.RData")
+
+if(file.exists(bas_derivatives)) {
+  print('basic terrain variables have already been derived')
+  load(bas_derivatives)
+  t1
+  
+  bathy <- raster(file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"))# load bathy file
+  projection(bathy)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+  bathy <- mask(bathy,mask)
+  
+  writeRaster(bathy,file.path(PredictorData, "bathy.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+  
+} else {
+
+  #bathy
+  ### AGGIUNTO:
+  bathy <- raster(file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"))# load bathy file
+  projection(bathy)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+  bathy <- mask(bathy,mask)
+  ###
+  ## derive terrain variables
+  tpi <- terrain(bathy, opt=c('tpi')) # included in Table 1
+
+  # TPI for different neighborhood size:
+  tpiw <- function(x, w=5) {
+	  m <- matrix(1/(w^2-1), nc=w, nr=w)
+	  m[ceiling(0.5 * length(m))] <- 0
+	  f <- focal(x, m)
+	  x - f
+  }
+
+  tpi_b <- tpiw(bathy, w=15) # included in Table 1
+  names(tpi_b) <- "tpi_b"
+  
+  tri <- terrain(bathy, opt=c('tri'))
+  rough <- terrain(bathy, opt=c('roughness'))
+  slope <- terrain(bathy, opt=c('slope'))
+
+  t1 <- stack(slope,
+              tpi,
+              tpi_b,
+              tri,
+              rough
+              )
+
+  save(t1,file=file.path(PredictorData, "t1.RData"))
+  
+  rm(slope,
+     tpi,
+     tpi_b,
+     tri,
+     rough
+     )
+  
+  t1
+}
+```
+#writeRaster(t1,file.path(PredictorData, "t1.tif"), options="INTERLEAVE=BAND",     overwrite=TRUE)
+
+
+
+### Additional terrain variables
+
+In this block we derive multiscale terrain variables using GRASS, which you need to install prior ro running this part of the workflow. These are all included in Table 1
+
+```{r message=TRUE, warning=TRUE}
+
+
+method <- c("aspect",
+              #"profc",
+              #"planc",
+              #"longc",
+              #"crosc",
+              #"minic",
+              #"maxic",
+              "feature") # only these two methods are used
+
+win_param_scale <- c(3,19,33) # only these three window sizes are used
+
+add_derivatives <- file.path(PredictorData, "t.RData")
+
+
+try(system('grass74 -c EPSG:32633 /home/jovyan/grassdata/utm_wgs84_33N/'), silent = TRUE)
+  
+  
+execGRASS('r.in.gdal', input=file.path(PredictorData,"Bathymetry", "BS_grid800m_utm33n.tif"),
+            flags=c('overwrite','o','e'), output='elev')     # o= override the prjection parameters, and e=extend the location
+  
+execGRASS('g.region', raster='elev', flags="p", res=as.character(xres(bathy)))
+  
+  #win_param_scale <- c(1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,33,35)
+slope_tolerance <- 1.0
+curvature_tolerance <- 0.0001
+exponent <- 0.0
+zscale <- 1.0
+  
+t <- stack()
+  
+for (j in 1:length(method)){
+    
+  for (i in 1:length(win_param_scale)){
+      #print(j,i)
+    execGRASS('r.param.scale', 
+                input='elev', 
+                output=paste(method[j],win_param_scale[i],sep="_"), 
+                size=as.integer(win_param_scale[i]), 
+                slope_tolerance=as.numeric(slope_tolerance), 
+                curvature_tolerance=as.numeric(curvature_tolerance), 
+                method=method[j], 
+                exponent=as.numeric(exponent), 
+                zscale=as.numeric(zscale), 
+                flags=c('overwrite', 'quiet'))
+      
+      #p<-raster(readRAST(paste(method[j], win_param_scale[i],sep="_")))
+      #t <- stack( t , p)
+      
+      print(paste(method[j],win_param_scale[i],sep="_"))
+}}
+    
+execGRASS('i.group', group="stack", subgroup="stack",
+          input=c("aspect_3","aspect_19","aspect_33",
+                  "feature_3","feature_19","feature_33"))
+
+execGRASS("r.out.gdal", input="stack",
+          output=file.path(PredictorData, "stack.img"), format="HFA",
+          flags=c('overwrite', 'quiet'))
+
+
+t <- stack(file.path(PredictorData, "stack.img"))
+names(t) <- paste(rep(method, each = length(win_param_scale)), win_param_scale, sep = "_")
+projection(t)<-"+proj=utm +north +zone=33 +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"
+
+save(t,file=file.path(PredictorData, "t.RData"))
+
+t
+
+#writeRaster(t,file.path(PredictorData, "t1.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+```
+
+### Ruggedness
+
+Implementation of the Sappington et al., (2007) vector ruggedness measure, as in the BTM tool.
+```{r, message=FALSE}
+
+rugged <- file.path(PredictorData, "vrm.RData")
+
+if(file.exists(rugged)) {
+  print('ruggedness has already been derived')
+  load(rugged)
+  vrm
+  
+} else {
+
+  vrm <- vrm(bathy) 
+  names(vrm) <- "vrm"
+  
+  save(vrm,file=file.path(PredictorData, "vrm.RData"))
+
+  vrm
+
+}
+
+#writeRaster(vrm,file.path(output_PredictorData, "t1.tif"), options="INTERLEAVE=BAND", overwrite=TRUE)
+```
